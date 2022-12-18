@@ -20,8 +20,9 @@
 */
 
 `define DATA_WIDTH 16
-`define CS_WIDTH 3
-`define ROW_WIDTH 13
+`define CS_WIDTH 2
+`define ROW_WIDTH 14
+`define COL_WIDTH 10
 `define BANK_WIDTH 3
 
 module axi_ddr_memory #(
@@ -89,8 +90,15 @@ module axi_ddr_memory #(
     output  [`ROW_WIDTH - 1 : 0]        em_ddr_addr,
     output  [`BANK_WIDTH - 1 : 0]       em_ddr_ba,
     output                              em_ddr_reset_n,
-    output                              ddr_init_done
+
+    output  [4 : 0]                     ddr_status
 );
+
+wire ddr_clk;
+wire rstn;
+wire aclk;
+wire aresetn;
+wire sclk;
 
 /*
 * Lattice defined DDR command
@@ -100,14 +108,12 @@ localparam DDR_CMD_READ     = 4'b0001;
 localparam DDR_CMD_WRITE    = 4'b0010;
 
 /*
-* AXI defined ERROR type
+* AXI defined response type
 */
 localparam AXI_RESP_OKAY    = 2'b00;
 localparam AXI_RESP_EXOKAY  = 2'b01;
 localparam AXI_RESP_SLVERR  = 2'b10;
 localparam AXI_RESP_DECERR  = 2'b11;
-
-wire sclk;
 
 /*
 * AXI Read/Write QoS and Arbitration
@@ -116,9 +122,9 @@ wire sclk;
 */
 
 localparam DDR_CMD_WIDTH    = 4;
-localparam DDR_ADDR_WIDTH   = 26;
+localparam DDR_ADDR_WIDTH   = `BANK_WIDTH + `ROW_WIDTH + `COL_WIDTH;
 localparam DDR_BURST_WIDTH  = 5;
-localparam CMD_FIFO_WIDTH   = DDR_ADDR_WIDTH + DDR_CMD_WIDTH + DDR_BURST_WIDTH + AXI_ID_WIDTH;
+localparam CMD_FIFO_WIDTH   = AXI_ADDR_WIDTH + DDR_CMD_WIDTH + DDR_BURST_WIDTH + AXI_ID_WIDTH;
 
 wire cmd_fifo_push, cmd_fifo_pop, cmd_fifo_empty, cmd_fifo_full;
 wire [CMD_FIFO_WIDTH - 1 : 0] cmd_fifo_odata, cmd_fifo_idata;
@@ -128,6 +134,7 @@ wire ddr_cmd_ok;
 
 wire [DDR_CMD_WIDTH - 1 : 0] ddr_cmd;
 wire [DDR_ADDR_WIDTH - 1 : 0] ddr_cmd_addr;
+wire [AXI_ADDR_WIDTH - 1 : 0] ddr_cmd_axi_addr;
 wire [AXI_ID_WIDTH - 1 : 0] ddr_cmd_axi_id;
 wire [4 : 0] ddr_cmd_burst_len;
 wire [4 : 0] ddr_cmd_axi_burst_len;
@@ -135,8 +142,9 @@ reg ddr_cmd_valid;
 
 assign cmd_fifo_pop = ~ddr_cmd_valid & ~cmd_fifo_empty;
 assign ddr_cmd_ok = ddr_cmd_ready & ddr_cmd_valid;
-assign {ddr_cmd_axi_burst_len, ddr_cmd_axi_id, ddr_cmd_addr, ddr_cmd} = cmd_fifo_odata;
+assign {ddr_cmd_axi_burst_len, ddr_cmd_axi_id, ddr_cmd_axi_addr, ddr_cmd} = cmd_fifo_odata;
 assign ddr_cmd_burst_len = ddr_cmd_axi_burst_len + 1'b1;
+assign ddr_cmd_addr = {ddr_cmd_axi_addr[`COL_WIDTH + `ROW_WIDTH - 1 -: `ROW_WIDTH], ddr_cmd_axi_addr[AXI_ADDR_WIDTH - 1 -: `CS_WIDTH + `BANK_WIDTH], ddr_cmd_axi_addr[`COL_WIDTH - 1 : 0]};
 /*
 * Expected Command Pop and DDR Response Waveform
 *                   ____      ____ ____ ____           ____
@@ -179,8 +187,7 @@ reg r_awready, r_arready;
 
 assign arbiter_en = (awvalid & arvalid);
 assign cmd_fifo_push = ((awvalid & awready) | (arvalid & arvalid));
-assign cmd_fifo_idata = arbiter_write ? {1'b0, awlen, awid, awaddr[DDR_ADDR_WIDTH - 1 : 0], DDR_CMD_WRITE} :
-                                        {1'b0, arlen, arid, araddr[DDR_ADDR_WIDTH - 1 : 0], DDR_CMD_READ};
+assign cmd_fifo_idata = arbiter_write ? {1'b0, awlen, awid, awaddr, DDR_CMD_WRITE} : {1'b0, arlen, arid, araddr, DDR_CMD_READ};
 
 assign awready = r_awready;
 assign arready = r_arready;
@@ -434,10 +441,11 @@ localparam DDR_DQS_WIDTH    = 2;
 // READ_PULSE_TAP setting for PCB routing compensation
 assign rpt  = {1'b0, 1'b1, 1'b0};   // use the default = 2
 assign ddr_read_pulse_tap = {DDR_DQS_WIDTH{rpt}};
+assign ddr_status = {ddr_wl_err, ddr_read_error_flag, ddr_write_error_flag, ddr_clocking_good, ddr_init_done};
 
 ddr3_sdram_mem_top u_ddr3_sdram_mem_top (
     .clk_in                 (ddr_clk            ),
-    .rst_n                  (rst_n              ),
+    .rst_n                  (rstn               ),
     .mem_rst_n              (mem_rst_n          ),
     .cmd                    (ddr_cmd            ),
     .addr                   (ddr_cmd_addr       ),
