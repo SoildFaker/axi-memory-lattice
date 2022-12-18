@@ -13,11 +13,20 @@
 *  - narrow transfer was not supported
 *  - burst length width was limited to 4 bit for hardware copatibility
 *  - lock, cache, prot bus functions was not implemented
+*
+* Reversion:
+*  - 0.1: Sun Dec 18 12:18:18 PM CST 2022
+*     - file created
 */
+
+`define DATA_WIDTH 16
+`define CS_WIDTH 3
+`define ROW_WIDTH 13
+`define BANK_WIDTH 3
 
 module axi_ddr_memory #(
     parameter AXI_ADDR_WIDTH    = 32,
-    parameter AXI_DATA_WIDTH    = 128,
+    parameter AXI_DATA_WIDTH    = `DATA_WIDTH * 4,
     parameter AXI_ID_WIDTH      = 4,
     parameter AXI_STRB_WIDTH    = AXI_DATA_WIDTH >> 3
 ) (
@@ -37,11 +46,10 @@ module axi_ddr_memory #(
     */
     input                               awvalid,
     output                              awready,
-    input   [AXI_ID_WIDTH - 1 : 0]      wid,
-    input   [AXI_DATA_WIDTH - 1 : 0]    wdata,
     /* not used
     input   [AXI_STRB_WIDTH - 1 : 0]    wstrb,
     */
+    input   [AXI_DATA_WIDTH - 1 : 0]    wdata,
     input                               wlast,
     input                               wvalid,
     output                              wready,
@@ -67,14 +75,22 @@ module axi_ddr_memory #(
     output                              rvalid,
     input                               rready,
     output                              rlast,
+    // inputs & outputs for memory interface
+    inout  [`DATA_WIDTH - 1 : 0]        em_ddr_data,
+    inout  [`DATA_WIDTH / 8 - 1 : 0]    em_ddr_dqs,
+    output [`DATA_WIDTH / 8 - 1 : 0]    em_ddr_dm,
+    output [`CS_WIDTH - 1 : 0]          em_ddr_clk,
+    output [`CS_WIDTH - 1 : 0]          em_ddr_cke,
+    output                              em_ddr_ras_n,
+    output                              em_ddr_cas_n,
+    output                              em_ddr_we_n,
+    output  [`CS_WIDTH - 1 : 0]         em_ddr_cs_n,
+    output  [`CS_WIDTH - 1 : 0]         em_ddr_odt,
+    output  [`ROW_WIDTH - 1 : 0]        em_ddr_addr,
+    output  [`BANK_WIDTH - 1 : 0]       em_ddr_ba,
+    output                              em_ddr_reset_n,
     output                              ddr_init_done
 );
-
-/*
-* AXI Read/Write QoS and Arbitration
-* Using simple R/W siwtch arbiter since we use different bank for read and write. Row miss is out of consideration.
-* The command valid signal is required to be asserted before ready signal and deasserted after ready signal.
-*/
 
 /*
 * Lattice defined DDR command
@@ -82,6 +98,22 @@ module axi_ddr_memory #(
 */
 localparam DDR_CMD_READ     = 4'b0001;
 localparam DDR_CMD_WRITE    = 4'b0010;
+
+/*
+* AXI defined ERROR type
+*/
+localparam AXI_RESP_OKAY    = 2'b00;
+localparam AXI_RESP_EXOKAY  = 2'b01;
+localparam AXI_RESP_SLVERR  = 2'b10;
+localparam AXI_RESP_DECERR  = 2'b11;
+
+wire sclk;
+
+/*
+* AXI Read/Write QoS and Arbitration
+* Using simple R/W siwtch arbiter since we use different bank for read and write. Row miss is out of consideration.
+* The command valid signal is required to be asserted before ready signal and deasserted after ready signal.
+*/
 
 localparam DDR_CMD_WIDTH    = 4;
 localparam DDR_ADDR_WIDTH   = 26;
@@ -98,11 +130,13 @@ wire [DDR_CMD_WIDTH - 1 : 0] ddr_cmd;
 wire [DDR_ADDR_WIDTH - 1 : 0] ddr_cmd_addr;
 wire [AXI_ID_WIDTH - 1 : 0] ddr_cmd_axi_id;
 wire [4 : 0] ddr_cmd_burst_len;
+wire [4 : 0] ddr_cmd_axi_burst_len;
 reg ddr_cmd_valid;
 
 assign cmd_fifo_pop = ~ddr_cmd_valid & ~cmd_fifo_empty;
 assign ddr_cmd_ok = ddr_cmd_ready & ddr_cmd_valid;
-assign {ddr_cmd_burst_len, ddr_cmd_axi_id, ddr_cmd_addr, ddr_cmd} = cmd_fifo_odata;
+assign {ddr_cmd_axi_burst_len, ddr_cmd_axi_id, ddr_cmd_addr, ddr_cmd} = cmd_fifo_odata;
+assign ddr_cmd_burst_len = ddr_cmd_axi_burst_len + 1'b1;
 /*
 * Expected Command Pop and DDR Response Waveform
 *                   ____      ____ ____ ____           ____
@@ -151,8 +185,8 @@ assign cmd_fifo_idata = arbiter_write ? {1'b0, awlen, awid, awaddr[DDR_ADDR_WIDT
 assign awready = r_awready;
 assign arready = r_arready;
 
-always @(posedge sclk) begin
-    if (~rstn) begin
+always @(posedge aclk) begin
+    if (~aresetn) begin
         arbiter_write <= 1'b0;
     end
     else begin
@@ -160,8 +194,8 @@ always @(posedge sclk) begin
     end
 end
 
-always @(posedge sclk) begin
-    if (~rstn) begin
+always @(posedge aclk) begin
+    if (~aresetn) begin
         r_awready <= 1'b0;
         r_arready <= 1'b0;
     end
@@ -176,6 +210,134 @@ always @(posedge sclk) begin
         end
     end
 end
+
+/*
+* AXI Write Data Channel
+* Based on Lattice DDR Controller IP limitation, we highly recommend you to write data before address
+*/
+localparam DATA_FIFO_WIDTH = AXI_DATA_WIDTH;
+
+wire data_ififo_push, data_ififo_pop;
+wire data_ififo_empty, cmd_fifo_full;
+wire [DATA_FIFO_WIDTH - 1 : 0] data_ififo_idata, data_ififo_odata;
+
+wire wready, wvalid;
+wire wlast;
+wire [AXI_DATA_WIDTH - 1 : 0] wdata;
+
+assign data_ififo_push = wvalid;
+assign data_ififo_idata = wdata;
+assign wready = ~data_ififo_full;
+
+/*
+* AXI Write Data Response Channel
+*/
+wire [AXI_ID_WIDTH - 1 : 0] bid;
+wire [1 : 0] bresp;
+
+reg r_bvalid;
+
+assign bid = ddr_cmd_axi_id;
+assign bresp = AXI_RESP_OKAY;
+assign bvalid = r_bvalid;
+
+always @(posedge aclk) begin
+    if (~aresetn) begin
+        r_bvalid <= 1'b0;
+    end
+    else begin
+        if (bvalid & bready) begin
+            r_bvalid <= 1'b0;
+        end
+        else begin
+            if (wlast) begin
+                r_bvalid <= 1'b1;
+            end
+        end
+    end
+end
+
+/*
+* AXI Read Response Channel
+*/
+
+wire data_ofifo_empty, data_ofifo_full;
+wire data_ofifo_pop, data_ofifo_push;
+wire [DATA_FIFO_WIDTH - 1 : 0] data_ofifo_idata, data_ofifo_odata;
+
+wire [AXI_ID_WIDTH - 1 : 0] rid;
+wire [AXI_DATA_WIDTH - 1 : 0] rdata;
+wire [1 : 0] rresp;
+wire rready;
+
+reg [4 : 0] burst_read_counter;
+reg r_rvalid;
+reg r_rlast;
+
+assign rid = ddr_cmd_axi_id;
+assign rdata = data_ofifo_odata;
+assign rresp = AXI_RESP_OKAY;
+assign rvalid = r_valid;
+assign rlast = r_rlast;
+
+assign data_ofifo_pop = (~data_ofifo_empty & rready);
+
+always @(posedge aclk)) begin
+    if (~aresetn) begin
+        r_rvalid <= 1'b0
+    end
+    else begin
+        r_rvalid <= ~data_ofifo_empty;
+    end
+end
+
+always @(posedge aclk) begin
+    if (~aresetn) begin
+        burst_read_counter <= 'b0;
+        r_rlast <= 1'b0;
+    end
+    else begin
+        if (data_ofifo_pop) begin
+            if (burst_read_counter == ddr_cmd_axi_burst_len) begin
+                burst_read_counter <= 'b0;
+                r_rlast <= 1'b1;
+            end
+            else begin
+                burst_read_counter <= burst_read_counter + 1'b1;
+            end
+        end
+        else begin
+            r_rlast <= 1'b0;
+        end
+    end
+end
+
+/*
+* DDR Write Channel
+* No need to check fifo empty flag, if DDR write ready and fifo empty was asserted at same time, it was considered as an error.
+*/
+localparam DDR_DATA_WIDTH = AXI_DATA_WIDTH;
+
+wire ddr_datain_ready;
+wire ddr_write_error_flag;
+wire [DDR_DATA_WIDTH - 1 : 0] ddr_write_data;
+
+assign data_ififo_pop = ddr_datain_ready;
+assign ddr_write_data = data_ififo_odata;
+assign ddr_write_error_flag = (ddr_datain_ready & data_ififo_empty);
+
+/*
+* DDR Read Channel
+* No need to check fifo full flag, if DDR read data valid and fifo full was asserted at same time, it was considered as an error.
+*/
+
+wire ddr_dataout_valid;
+wire ddr_read_error_flag;
+wire [DDR_DATA_WIDTH - 1 : 0] ddr_read_data;
+
+assign data_ofifo_push = ddr_dataout_valid;
+assign data_ofifo_idata = ddr_read_data;
+assign ddr_read_error_flag = (ddr_dataout_valid & data_ofifo_full);
 
 async_fifo_wrapper #(
     .DEPTH                  (16                 ),
@@ -223,13 +385,14 @@ async_fifo_wrapper #(
 * DDR Reset and Initilization
 * Lattice require a 200us reset duration at least before initial sequence start.
 */
-localparam DDR_RESET_DURATION_CNT = 'd40000; // freq. = 100MHz, then period = 10ns, 10ns * 40000 = 400us
+localparam DDR_RESET_DURATION_CNT = 'd40000; // if freq. = 100MHz, then period = 10ns, 10ns * 40000 = 400us
 
 wire init_done;
 wire mem_rst_n;
 
 reg [31 : 0] r_ddr_init_counter;
-reg init_start;
+reg ddr_init_start;
+reg ddr_init_done;
 reg mem_rst_n;
 
 assign mem_rst_n = r_ddr_reset_counter == DDR_RESET_DURATION_CNT;
@@ -247,15 +410,17 @@ end
 
 always @(posedge sclk) begin
     if (~rstn) begin
-        init_start <= 1'b0;
+        ddr_init_start <= 1'b0;
+        ddr_init_done <= 1'b0;
     end
     else begin
         if (r_ddr_reset_counter == (DDR_RESET_DURATION_CNT - 1'b1)) begin
-            init_start <= 1'b1;
+            ddr_init_start <= 1'b1;
         end
         else begin
             if (init_done) begin
-                init_start <= 1'b0;
+                ddr_init_start <= 1'b0;
+                ddr_init_done <= 1'b1;
             end
         end
     end
@@ -264,6 +429,11 @@ end
 /*
 * DDR3 IP core instantiation
 */
+localparam DDR_DQS_WIDTH    = 2;
+
+// READ_PULSE_TAP setting for PCB routing compensation
+assign rpt  = {1'b0, 1'b1, 1'b0};   // use the default = 2
+assign ddr_read_pulse_tap = {DDR_DQS_WIDTH{rpt}};
 
 ddr3_sdram_mem_top u_ddr3_sdram_mem_top (
     .clk_in                 (ddr_clk            ),
@@ -274,35 +444,35 @@ ddr3_sdram_mem_top u_ddr3_sdram_mem_top (
     .cmd_valid              (ddr_cmd_valid      ),
     .ofly_burst_len         (1'b1               ), // fixed 8 burst length
     .cmd_burst_cnt          (ddr_cmd_burst_len  ),
-    .init_start             (init_start),
-    .write_data             (write_data),
-    .data_mask              (data_mask),
+    .init_start             (ddr_init_start     ),
+    .write_data             (ddr_write_data     ),
+    .data_mask              (2'b11              ), // all byte enabled
     .cmd_rdy                (ddr_cmd_ready      ),
-    .init_done              (init_done),
-    .datain_rdy             (datain_rdy),
-    .wl_err                 (wl_err),
-    .clocking_good          (clocking_good),
+    .init_done              (init_done          ),
+    .datain_rdy             (ddr_datain_ready   ),
+    .wl_err                 (ddr_wl_err         ),
+    .clocking_good          (ddr_clocking_good  ),
   `ifdef EXT_AUTO_REF
     .ext_auto_ref           (1'b0               ),
     .ext_auto_ref_ack       (                   ),
   `endif
-    .read_data              (read_data),
-    .read_data_valid        (read_data_valid),
-    .read_pulse_tap         (read_pulse_tap),
-    .em_ddr_data            (em_ddr_data),
-    .em_ddr_dqs             (em_ddr_dqs),
-    .em_ddr_clk             (em_ddr_clk),
-    .em_ddr_reset_n         (em_ddr_reset_n),
-    .em_ddr_cke             (em_ddr_cke),
-    .em_ddr_ras_n           (em_ddr_ras_n),
-    .em_ddr_cas_n           (em_ddr_cas_n),
-    .em_ddr_we_n            (em_ddr_we_n),
-    .em_ddr_cs_n            (em_ddr_cs_n),
-    .em_ddr_odt             (em_ddr_odt),
-    .em_ddr_dm              (em_ddr_dm),
-    .em_ddr_ba              (em_ddr_ba),
-    .em_ddr_addr            (em_ddr_addr),
-    .sclk_out               (sclk)
+    .read_data              (ddr_read_data      ),
+    .read_data_valid        (ddr_dataout_valid  ),
+    .read_pulse_tap         (ddr_read_pulse_tap ),
+    .em_ddr_data            (em_ddr_data        ),
+    .em_ddr_dqs             (em_ddr_dqs         ),
+    .em_ddr_clk             (em_ddr_clk         ),
+    .em_ddr_reset_n         (em_ddr_reset_n     ),
+    .em_ddr_cke             (em_ddr_cke         ),
+    .em_ddr_ras_n           (em_ddr_ras_n       ),
+    .em_ddr_cas_n           (em_ddr_cas_n       ),
+    .em_ddr_we_n            (em_ddr_we_n        ),
+    .em_ddr_cs_n            (em_ddr_cs_n        ),
+    .em_ddr_odt             (em_ddr_odt         ),
+    .em_ddr_dm              (em_ddr_dm          ),
+    .em_ddr_ba              (em_ddr_ba          ),
+    .em_ddr_addr            (em_ddr_addr        ),
+    .sclk_out               (sclk               )
 );
 
 endmodule
